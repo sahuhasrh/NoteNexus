@@ -1,0 +1,13 @@
+flask
+flask-cors
+paddleocr==2.7.3
+paddlepaddle==2.6.2
+google-genai
+chromadb
+sentence-transformers
+spacy
+python-dotenv
+Pillow
+opencv-python==4.6.0.66
+numpy>=1.24,<2
+shortuuid

@@ -1,0 +1,71 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+env/
+venv/
+.venv/
+.venv-1/
+
+backend/.env
+backend/htn21-gcp-creds.json
+backend/models/
+backend/images/final-model
+node_modules/
+env/
+.venv/
+
+# =========================
+# Node / React
+# =========================
+node_modules/
+dist/
+build/
+
+# =========================
+# Environment & Secrets
+# =========================
+.env
+.env.local
+htn21-gcp-creds.json
+
+# =========================
+# Database / Vector DB
+# =========================
+backend/notes.db
+backend/chroma_db/
+
+# Ignore all model files
+backend/models/*
+
+# =========================
+# Media
+# =========================
+*.mp4
+
+# =========================
+# VS Code
+# =========================
+.vscode/
+
+# =========================
+# OS files
+# =========================
+Thumbs.db
+.DS_Store
+SETUP_WINDOWS.md
+
+
+
+# Secrets
+backend/htn21-gcp-creds.json
+backend/.env
+
+# Large models
+backend/models/
+backend/images/final-model
