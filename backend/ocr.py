@@ -1,99 +1,65 @@
-# Must set before any Paddle import (fixes Windows oneDNN / PIR crashes)
-import os
-import threading
-
-os.environ["FLAGS_use_mkldnn"] = "0"
-os.environ["DISABLE_MODEL_SOURCE_CHECK"] = "True"
-
 import base64
-import io
 
+import cv2
 import numpy as np
-from PIL import Image
+import pytesseract
 
-_ocr = None
-_ocr_lock = threading.Lock()
+pytesseract.pytesseract.tesseract_cmd = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+)
 
-
-def _get_ocr():
-    global _ocr
-    if _ocr is None:
-        from paddleocr import PaddleOCR
-
-        # Angle classifier causes crashes under concurrent calls on Windows.
-        _ocr = PaddleOCR(
-            use_angle_cls=False,
-            lang="en",
-            show_log=False,
-            use_gpu=False,
-        )
-    return _ocr
+def _decode_base64_image(base64_img):
+    if not base64_img:
+        raise ValueError("imageData is required")
+    if "," in base64_img:
+        base64_img = base64_img.split(",", 1)[1]
+    img_bytes = base64.b64decode(base64_img)
+    img = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Invalid image data")
+    return img
 
 
-def _parse_ocr_result(result):
-    """Normalize PaddleOCR 2.x result into lines with GCP-compatible boxes."""
+def preprocess(base64_img):
+    img = _decode_base64_image(base64_img)
+    original_height, original_width = img.shape[:2]
+    img = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.convertScaleAbs(gray, alpha=1.5, beta=0)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return binary, original_width, original_height
+
+
+def run_ocr(base64_img):
+    processed, image_width, image_height = preprocess(base64_img)
+    data = pytesseract.image_to_data(
+        processed,
+        output_type=pytesseract.Output.DICT,
+        config="--psm 6",
+    )
     lines = []
-    if not result:
-        return lines
-
-    items = result[0] if isinstance(result, list) and result else result
-    if not items:
-        return lines
-
-    for item in items:
-        if not item or len(item) < 2:
-            continue
-        box = item[0]
-        text_part = item[1]
-        if isinstance(text_part, (list, tuple)):
-            text = text_part[0]
-        else:
-            text = str(text_part)
-
-        if not text or not box:
-            continue
-
-        xs = [p[0] for p in box]
-        ys = [p[1] for p in box]
-        x = int(min(xs))
-        y = int(min(ys))
-        width = int(max(xs) - min(xs))
-        height = int(max(ys) - min(ys))
-
-        lines.append(
-            {
-                "text": text,
-                "bounding_box": {
-                    "x": x,
-                    "y": y,
-                    "width": width,
-                    "height": height,
-                },
-            }
-        )
-
-    return lines
-
-
-def paddle_ocr(image_content):
-    """Run PaddleOCR on a base64 image and return GCP-compatible format."""
-    if not image_content:
-        return [], []
-
-    content = base64.b64decode(image_content)
-    image = Image.open(io.BytesIO(content)).convert("RGB")
-    image_np = np.array(image)
-
-    with _ocr_lock:
-        ocr = _get_ocr()
-        result = ocr.ocr(image_np, cls=False)
-
-    lines = _parse_ocr_result(result)
-    paragraphs = []
-    if lines:
-        paragraphs.append(" ".join(line["text"] for line in lines))
-
-    return paragraphs, lines
-
-
-gcp_ocr = paddle_ocr
+    for i, raw_text in enumerate(data["text"]):
+        text = raw_text.strip()
+        try:
+            conf = float(data["conf"][i])
+        except (TypeError, ValueError):
+            conf = -1
+        if text and conf > 60:
+            x = data["left"][i] // 2
+            y = data["top"][i] // 2
+            w = data["width"][i] // 2
+            h = data["height"][i] // 2
+            lines.append(
+                {
+                    "text": text,
+                    "bounding_box": {"x": x, "y": y, "width": w, "height": h},
+                    "confidence": conf,
+                }
+            )
+    full_text = " ".join(line["text"] for line in lines)
+    return {
+        "lines": lines,
+        "full_text": full_text,
+        "image_width": image_width,
+        "image_height": image_height,
+    }

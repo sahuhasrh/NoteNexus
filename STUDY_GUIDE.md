@@ -1,469 +1,336 @@
-# NotesNexus — Technical Study Guide
+# NotesNexus System Design Guide
 
-## Project Overview
+## Problem
 
-NotesNexus is a Chrome extension that makes on-screen video text selectable and copyable, like a normal webpage. It captures video frames, runs local OCR on a Flask backend, and draws transparent HTML overlays aligned to detected text regions.
+Lecture videos often contain useful slide text, formulas, definitions, and diagrams, but the browser treats the video as pixels. Students have to pause, zoom, and manually retype content. NotesNexus turns video text into selectable browser text and builds a lightweight note-taking layer on top of captured lecture content.
 
-It solves the problem of taking notes from fast-moving lecture videos where pausing and retyping slides is tedious. It works on any site that renders video in an HTML5 `<video>` element, including YouTube, Google Meet, and Discord, because those platforms expose standard `<video>` elements that support `captureStream()` and `ImageCapture`.
+## Product Flow
 
----
+1. User opens a page with an HTML5 `<video>`.
+2. User clicks **Start NotesNexus** in the extension popup.
+3. `client/inject.js` captures video frames and sends them to `client/ocr-worker.js`.
+4. The worker hashes the frame. If unchanged, it skips all network and backend work.
+5. If changed, the worker compresses the frame and sends it to Flask.
+6. Flask preprocesses the image, runs Tesseract OCR, extracts key terms, and stores useful slide text.
+7. The content script draws transparent selectable text overlays above the video.
+8. The popup accumulates lecture key terms across slides and stores them per video URL.
+9. User can click **Summarize Notes**, **Ask**, or **Show Slide Timeline**.
 
-## Core Mechanism — How Text Selection on Video Works
+## Architecture
 
-1. **Frame capture (`client/inject.js`)**  
-   Every 3 seconds, the content script finds `document.querySelector("video")`, calls `video.captureStream()`, grabs one frame with `ImageCapture.grabFrame()`, and draws it to a hidden off-screen canvas (`#ghost`).
-
-2. **Send to Flask**  
-   The canvas is exported as a base64 PNG data URL. The prefix `data:image/png;base64,` is stripped and the raw base64 string is POSTed to `http://localhost:8000/process` as `{ "imageData": "<base64>" }`.
-
-3. **PaddleOCR (`backend/ocr.py`)**  
-   Flask decodes base64 → PIL image → numpy array. PaddleOCR returns polygons and text per detection. Each polygon is converted to `{ x, y, width, height }` plus `text`, matching the format GCP Vision used.
-
-4. **Coordinate scaling (`client/inject.js`)**  
-   OCR coordinates are in native frame pixels. The script scales them to the displayed video size:
-   - `wScale = video.offsetWidth / frameWidth`
-   - `hScale = video.offsetHeight / frameHeight`
-   - Overlay position: `x * wScale`, `y * hScale`, etc.
-
-5. **HTML overlays**  
-   For each line, a `<div>` is created with `position: absolute`, `color: transparent`, `userSelect: text`, and `fontSize` set from bounding box height. The div is placed at the scaled screen position over the video. Transparent text sits on top of visible video text so the user can drag-select and copy.
-
-6. **Live video**  
-   The interval loop re-grabs frames and only redraws overlays when detected text changes (`isDifferent`), so overlays track new slides without breaking the core selection behavior.
-
----
-
-## Architecture Diagram
-
-```
-[Chrome Extension — client/]
-      |
-      | video frame (base64)
-      v
-[Flask Backend :8000]
-      |
-      ├── PaddleOCR → text + bounding boxes
-      |       ↓
-      |   returned to extension
-      |       ↓
-      |   HTML divs drawn over video
-      |
-      ├── Gemini 1.5 Flash → structured summary
-      |
-      ├── spaCy → named entities (key topics)
-      |
-      ├── sentence-transformers → embeddings
-      |         ↓
-      |     ChromaDB (local vector store)
-      |
-      ├── POST /ask → RAG → Gemini → answer
-      |
-      └── SQLite (notes.db) → saved notes
+```text
+Chrome Popup
+    |
+    v
+inject.js on video page
+    |
+    | ImageBitmap frames
+    v
+ocr-worker.js
+    |-- frame hash
+    |-- backpressure queue
+    |-- JPEG compression
+    |
+    | POST /process
+    v
+Flask Backend
+    |-- OpenCV preprocessing
+    |-- Tesseract OCR
+    |-- YAKE keywords
+    |-- SQLite timeline
+    |
+    v
+Popup + video overlays
 ```
 
----
+## Frontend Design
 
-## Complete File Structure
+### `client/inject.js`
 
-### Repository layout
+The content script is responsible for page interaction only:
 
-| Path | Purpose |
-|------|---------|
-| `client/` | **Working Chrome extension** (load this in Chrome) |
-| `client2.0/` | Older/experimental fork (“Injecta”); not the primary extension |
-| `backend/` | Flask API server |
-| `test/` | Manual test page (unchanged) |
-| `requirements.txt` | Python dependencies |
-| `STUDY_GUIDE.md` | This document |
+- Finds the page `<video>` element.
+- Captures frames to canvas.
+- Converts the canvas to `ImageBitmap`.
+- Sends frames to the Web Worker.
+- Draws transparent selectable text overlays.
+- Clears old overlays before every redraw to prevent overlap.
 
----
+It intentionally does not run OCR, make backend requests, or do heavy frame hashing on the page thread anymore.
 
-### `client/manifest.json`
+### `client/ocr-worker.js`
 
-Chrome MV2 manifest for NotesNexus.
+The worker handles the expensive path:
 
-- **Permissions:** `https://*/*`, `http://*/*`, `activeTab`, `tabs`, `storage` — needed to inject scripts, read tab URLs, and persist popup UI state.
-- **background.js:** Runs persistently; injects `inject.js` when popup signals capture.
-- **browser_action:** Popup at `src/browser_action/browser_action.html`.
+- Computes a 32x32 grayscale perceptual-ish hash with `OffscreenCanvas`.
+- Compares hash distance against the previous frame.
+- Skips unchanged frames before any base64 encoding or network call.
+- Downscales frames to 50%.
+- Converts frames to JPEG at 85% quality.
+- Sends changed frames to `/process`.
+- Uses a latest-frame-only queue for backpressure.
 
----
+This keeps video playback smoother because CPU-heavy image processing and request management are outside the main page execution path.
 
-### `client/inject.js` (core overlay — do not modify behavior)
+## Performance Optimizations
 
-**Classes**
+### 1. Browser-Side Frame Hashing
 
-| Class | Role |
-|-------|------|
-| `Rect(x, y, width, height, value)` | Stores one text region and its string |
-| `Canvas` | Manages overlay divs and clearing |
+Earlier designs sent every captured frame to the backend just to learn that nothing changed. The current design hashes frames in the browser worker first.
 
-**Functions**
+Impact:
 
-| Function | Inputs | Returns | Description |
-|----------|--------|---------|-------------|
-| `getAPI(data)` | `data`: data URL string | `Promise<object>` | Strips data-URL prefix, POSTs base64 to `/process`, returns JSON |
-| `isDifferent(seen, incoming)` | `seen`: object map, `incoming`: Rect[] | `boolean` | True if any new text line appeared |
-| `main()` | none | void | Creates ghost canvas, starts 3s interval loop |
+- No base64 encoding for unchanged frames.
+- No HTTP request for unchanged frames.
+- No backend OCR for unchanged frames.
+- Lower CPU, memory, and network usage.
 
-**`Canvas.showRects(rects)`**  
-- Input: `Rect[]`  
-- Creates absolutely positioned transparent `<div>` elements over the video using scaled coordinates.  
-- Sets `z-index` high and `userSelect: text` so text is selectable.
+### 2. Web Worker Offloading
 
----
+Hashing, compression, and network request flow happen in `ocr-worker.js`, not directly in `inject.js`.
 
-### `client/background.js`
+Why this matters:
 
-| Listener | Trigger | Action |
-|----------|---------|--------|
-| `chrome.runtime.onMessage` | `{ myPopupIsOpen: true }` | `chrome.tabs.executeScript` with `inject.js` |
-| `chrome.browserAction.onClicked` | Toolbar click (no popup) | Injects `inject.js` |
+- The video page remains responsive.
+- Canvas/image work is less likely to stutter playback.
+- The capture loop stays small and predictable.
 
----
+### 3. Backpressure Queue
 
-### `client/src/browser_action/popup.js`
+OCR can be slower than the capture interval. Instead of letting requests pile up, the worker keeps:
 
-| Function | Inputs | Returns | Description |
-|----------|--------|---------|-------------|
-| `getActiveTabUrl()` | none | `Promise<string>` | Queries active tab URL for SQLite/RAG keys |
-| `appendAccumulatedText(newText)` | `string` | void | Appends OCR text to `chrome.storage.local` |
-| `loadSavedNotes(pageUrl)` | URL string | `Promise<void>` | GET `/notes` and fills popup lists |
+- `processing`: the current frame being processed.
+- `pending`: only the latest waiting frame.
 
-**Event handlers**
+If another frame arrives while OCR is running, the older pending frame is dropped. This is the right behavior for live video because stale frames are less valuable than the newest frame.
 
-- **Capture button:** Sends `{ myPopupIsOpen: true }` to background → inject starts.
-- **`chrome.runtime.onMessage`:** Receives OCR results from inject; updates notes, entities, summary UI.
-- **Take Notes:** POST `/index_notes` + `/summarize` with accumulated text.
-- **Ask:** POST `/ask` with question + tab URL.
+Benefits:
 
----
+- Prevents request pileups.
+- Avoids memory growth from queued images.
+- Protects the Flask server from burst overload.
+- Keeps overlays closer to the current video state.
 
-### `client/src/browser_action/browser_action.html`
+### 4. Image Compression Before Upload
 
-Popup UI: capture button, Take Notes, Q&A input, notes/entities/summary tabs.
+The worker downscales the frame and sends JPEG instead of full-resolution PNG.
 
----
+Current strategy:
 
-### `client/src/content/content.js`
+- 50% width and height.
+- JPEG quality 0.85.
+- Backend still receives enough visual detail for Tesseract after preprocessing.
 
-Legacy content script; responds to `report_back` messages with page HTML. Not used by the main overlay flow.
+Why it helps:
 
----
+- PNG video frames are large.
+- JPEG payloads are much smaller.
+- Smaller requests mean lower latency and less backend pressure.
 
-### `client/js/framegrab.js`
+### 5. Progressive Slide Reveal Merging
 
-Early prototype of frame grab + overlay logic; superseded by `inject.js`.
+Many lecture slides reveal bullet points one by one. A naive OCR timeline treats each reveal as a new slide. `backend/database.py` compares word overlap and sequence similarity, then updates the latest slide row when the new text is basically the same slide with more content.
 
----
+Benefits:
+
+- Cleaner slide timeline.
+- Better summaries because repeated partial slide text is reduced.
+- More accurate slide numbering.
+
+## Backend Design
 
 ### `backend/app.py`
 
-Flask application entry point.
+Routes:
 
-| Function | Parameters | Returns | Description |
-|----------|------------|---------|-------------|
-| `root()` | none | JSON welcome | Health check |
-| `test()` | none | JSON | Simple test route |
-| `new_session()` | none | `{ uuid }` | Session id (legacy) |
-| `process()` | POST JSON | OCR + NER + summary | Main frame processing |
-| `summarize()` | POST JSON | summary + entities | Gemini summarization |
-| `index_notes()` | POST JSON | chunk count | RAG indexing |
-| `ask()` | POST JSON | `{ answer }` | RAG Q&A |
-| `notes()` | GET `page_url` | saved notes list | SQLite load |
-
----
+- `GET /`: health/welcome route.
+- `GET /test`: simple status check.
+- `POST /process`: OCR one changed frame.
+- `POST /summarize`: summarize captured text for the current page.
+- `POST /ask`: answer a question using captured text for the current page.
+- `GET /timeline`: return slide timeline for a page URL.
+- `GET /notes`: return saved summary and full text for a page URL.
 
 ### `backend/ocr.py`
 
-| Function | Parameters | Returns | Description |
-|----------|------------|---------|-------------|
-| `paddle_ocr(image_content)` | base64 string | `(paragraphs, lines)` | Runs PaddleOCR; maps boxes to GCP-compatible format |
-| `gcp_ocr` | alias | same | Backward-compatible name for `app.py` |
+OCR pipeline:
 
-**Line format (unchanged for extension):**
+1. Decode base64 image.
+2. Decode image bytes through OpenCV.
+3. Resize 2x for OCR readability.
+4. Convert to grayscale.
+5. Increase contrast.
+6. Apply Otsu thresholding.
+7. Run `pytesseract.image_to_data`.
+8. Return text, confidence, bounding boxes, and source image dimensions.
 
-```json
-{
-  "text": "Hello world",
-  "bounding_box": { "x": 10, "y": 20, "width": 200, "height": 24 }
-}
-```
-
----
-
-### `backend/summarization.py`
-
-| Function | Parameters | Returns | Description |
-|----------|------------|---------|-------------|
-| `summarize_gemini(text)` | `str` | `str` | Calls Gemini 1.5 Flash with lecture-assistant prompt |
-| `summarize_bart(text)` | `str` | `str` | Alias → `summarize_gemini` |
-
----
-
-### `backend/ner.py` (unchanged)
-
-| Function | Parameters | Returns | Description |
-|----------|------------|---------|-------------|
-| `ner_spacy(text)` | `str` | `list[{entity, label}]` | spaCy NER on English text |
-
----
-
-### `backend/rag.py`
-
-| Function | Parameters | Returns | Description |
-|----------|------------|---------|-------------|
-| `chunk_text(text)` | text, optional sizes | `list[str]` | 200-word chunks, 50-word overlap |
-| `index_lecture_text(page_url, text)` | URL, text | `{ chunks_indexed }` | Embeds chunks, stores in ChromaDB |
-| `ask_question(page_url, question)` | URL, question | `str` | Top-3 retrieval + Gemini answer |
-
----
+The returned image dimensions are important because the frontend uses them to scale OCR boxes back onto the displayed video.
 
 ### `backend/database.py`
 
-| Function | Parameters | Returns | Description |
-|----------|------------|---------|-------------|
-| `init_db()` | none | void | Creates `notes` table if missing |
-| `save_note(...)` | url, text, summary, entities | void | INSERT into SQLite |
-| `get_notes_for_url(page_url)` | URL | `list[dict]` | SELECT notes for URL |
+SQLite stores:
 
----
+- Slide text.
+- Slide number.
+- Video timestamp.
+- Per-URL summaries.
 
-## Every API Route
+The backend uses similarity checks to avoid duplicate slides:
 
-### `GET /`
+- Exact normalized text match.
+- Word-overlap match for progressive reveals.
+- `SequenceMatcher` fallback for near-duplicate OCR output.
 
-- **Input:** none  
-- **Output:** `{ "message": "Welcome to NotesNexus API" }`  
-- **Steps:** Return static JSON.
+If a new OCR result is the same logical slide but has more text, the existing slide row is updated instead of inserting a duplicate.
 
----
+### `backend/ner.py`
+
+YAKE is used locally to extract:
+
+- Technical keywords and two-word concepts.
+- Proper nouns with a small regex pass.
+- Filtered terms that remove common YouTube/UI noise such as subscribe, share, like, channel, notification, and sponsor.
+
+The popup labels this as **Lecture key terms** because keyword extraction is more useful for lecture slides than strict named-entity recognition. Terms accumulate across the lecture instead of disappearing when the slide changes.
+
+### Popup Term Accumulation
+
+`client/src/browser_action/popup.js` keeps a unique list of terms for the active URL. `client/background.js` also stores OCR terms when the popup is closed, so reopening the popup still shows the lecture-wide term list.
+
+Storage key format:
+
+```text
+notesnexus_terms_<page_url>
+```
+
+Both backend and popup filter common video-platform words so terms like `subscribe`, `share`, and `YouTube channel` do not pollute the lecture concepts.
+
+### `backend/gemini.py`
+
+Gemini is intentionally not called during live capture.
+
+It is only used when the user clicks:
+
+- **Summarize Notes**
+- **Ask**
+
+This avoids slow automatic LLM calls, lowers quota usage, and keeps live OCR responsive.
+
+## Data Model
+
+### `slides`
+
+```sql
+id INTEGER PRIMARY KEY AUTOINCREMENT
+url TEXT NOT NULL
+text TEXT NOT NULL
+slide_number INTEGER
+timestamp TEXT
+created_at TEXT DEFAULT CURRENT_TIMESTAMP
+```
+
+### `sessions`
+
+```sql
+id INTEGER PRIMARY KEY AUTOINCREMENT
+url TEXT NOT NULL UNIQUE
+summary TEXT
+updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+```
+
+## API Details
 
 ### `POST /process`
 
-- **Input JSON:**
-  ```json
-  {
-    "imageData": "<base64 PNG without data-URL prefix>",
-    "page_url": "https://www.youtube.com/watch?v=..."
-  }
-  ```
-- **Output JSON:**
-  ```json
-  {
-    "full_text": "line1 . line2",
-    "lines": [{ "text": "...", "bounding_box": { "x", "y", "width", "height" } }],
-    "entities": [{ "entity": "Einstein", "label": "PERSON" }],
-    "summary": "structured notes from Gemini"
-  }
-  ```
-- **Steps:**
-  1. Parse JSON body (`flask.request`)
-  2. `paddle_ocr(imageData)` — PaddleOCR + Pillow + numpy
-  3. Join paragraphs into `full_text`
-  4. `ner_spacy(full_text)` — spaCy
-  5. `summarize_gemini(full_text)` — google-generativeai
-  6. Return JSON; on response close, `save_note()` if `page_url` provided — sqlite3
+Request:
 
----
+```json
+{
+  "imageData": "base64 jpeg",
+  "page_url": "https://example.com/lecture",
+  "timestamp": "12:34"
+}
+```
+
+Response:
+
+```json
+{
+  "saved": true,
+  "lines": [
+    {
+      "text": "Gradient Descent",
+      "bounding_box": { "x": 40, "y": 90, "width": 300, "height": 32 },
+      "confidence": 87.2
+    }
+  ],
+  "entities": [{ "entity": "Gradient Descent", "label": "KEYWORD" }],
+  "full_text": "Gradient Descent ...",
+  "slide_number": 3,
+  "image_width": 640,
+  "image_height": 360
+}
+```
 
 ### `POST /summarize`
 
-- **Input JSON:**
-  ```json
-  { "text": "accumulated lecture text", "page_url": "https://..." }
-  ```
-- **Output JSON:**
-  ```json
-  { "summary": "...", "entities": [...] }
-  ```
-- **Steps:**
-  1. Validate `text`
-  2. `ner_spacy(text)` — spaCy
-  3. `summarize_gemini(text)` — Gemini with lecture-assistant prompt
-  4. `save_note()` if `page_url` set — SQLite
-  5. Return JSON
+Uses all captured text for a page URL and returns structured notes:
 
----
-
-### `POST /index_notes`
-
-- **Input JSON:**
-  ```json
-  { "text": "all captured text", "page_url": "https://..." }
-  ```
-- **Output JSON:**
-  ```json
-  { "chunks_indexed": 12 }
-  ```
-- **Steps:**
-  1. `chunk_text()` — 200 words, 50 overlap
-  2. `SentenceTransformer.encode()` — all-MiniLM-L6-v2
-  3. ChromaDB create/replace collection named `md5(page_url)`
-  4. `collection.add(documents, embeddings, ids)`
-
----
+- Summary
+- Key concepts
+- Entities
+- Bullet notes
 
 ### `POST /ask`
 
-- **Input JSON:**
-  ```json
-  { "question": "What is photosynthesis?", "page_url": "https://..." }
-  ```
-- **Output JSON:**
-  ```json
-  { "answer": "..." }
-  ```
-- **Steps:**
-  1. Load ChromaDB collection for `md5(page_url)`
-  2. Embed question with sentence-transformers
-  3. `collection.query(n_results=3)`
-  4. Build Gemini prompt with top 3 excerpts
-  5. Return `answer` text
+Answers a user question using captured lecture content only.
 
----
+### `GET /timeline`
 
-### `GET /notes?page_url=...`
+Returns the deduplicated slide timeline with timestamps.
 
-- **Input:** query param `page_url`  
-- **Output:** `{ "notes": [ { id, page_url, raw_text, summary, entities, created_at } ] }`  
-- **Steps:** `get_notes_for_url()` from SQLite
+### `GET /notes`
 
----
+Returns saved summary and full captured text.
 
-## RAG Pipeline Detail
+## Reliability And Failure Handling
 
-**What RAG is:** Retrieval-Augmented Generation — retrieve relevant snippets first, then ask the LLM to answer using only those snippets.
+- If no video exists, capture exits quietly.
+- If a frame is unchanged, no backend request is made.
+- If OCR is slower than capture, old pending frames are dropped.
+- If backend returns an error, the worker posts an error message instead of crashing the page.
+- If the user stops capture, overlays are cleared and worker hash state is reset.
+- Old overlays are always removed before drawing new overlays.
+- Key terms are accumulated per URL and filtered for common YouTube/UI text.
 
-**Why not send full text to Gemini:** Long lectures exceed context limits, add latency/cost, and dilute focus. Chunking + retrieval sends only the 3 most relevant passages.
+## Why This Is More Than A Basic OCR Demo
 
-**Chunking:** 200 words per chunk, 50-word overlap so concepts split across chunk boundaries still appear in at least one chunk.
+NotesNexus handles real-time constraints that show up in production systems:
 
-**all-MiniLM-L6-v2:** Outputs **384-dimensional** dense vectors per sentence/chunk.
-
-**ChromaDB:** Stores embeddings locally; cosine similarity search returns top-3 chunks for a question embedding.
-
-**Gemini prompt (word for word):**
-
-```
-Answer this question using only these excerpts from a lecture video. If answer is not present say 'This was not covered in the captured content.'
-
-Excerpts:
-{chunk_1}
-{chunk_2}
-{chunk_3}
-
-Question: {question}
-```
-
----
-
-## Chrome Extension Architecture
-
-### manifest.json permissions
-
-| Permission | Why |
-|------------|-----|
-| `https://*/*`, `http://*/*` | Inject on video sites |
-| `activeTab` | Access current tab when user clicks extension |
-| `tabs` | Read tab URL for RAG/SQLite keys |
-| `storage` | Persist popup HTML and accumulated OCR text |
-
-### Messaging flow
-
-**Popup → Background (start capture):**
-
-```javascript
-chrome.runtime.sendMessage({ myPopupIsOpen: true });
-```
-
-**Background → inject.js:**
-
-```javascript
-chrome.tabs.executeScript(null, { file: "./inject.js" });
-```
-
-**inject.js → Popup (OCR results):**
-
-```javascript
-chrome.runtime.sendMessage(response); // full /process JSON
-```
-
-**Popup listener:**
-
-```javascript
-chrome.runtime.onMessage.addListener((msg) => {
-  // msg.lines, msg.entities, msg.summary, msg.full_text
-});
-```
-
----
-
-## Complete Data Flow
-
-1. User opens YouTube video — page loads `<video>`.
-2. User clicks **Start NotesNexus** — `popup.js` sends `{ myPopupIsOpen: true }`.
-3. `background.js` injects `inject.js` into the tab.
-4. `inject.js` `main()` starts 3s `setInterval`.
-5. `ImageCapture.grabFrame()` captures current frame → hidden canvas → `toDataURL()`.
-6. `getAPI()` POSTs base64 to Flask `/process`.
-7. Flask runs PaddleOCR → lines + boxes; spaCy → entities; Gemini → summary.
-8. JSON returned to inject; scales boxes; `Canvas.showRects()` draws transparent divs.
-9. If text changed, `chrome.runtime.sendMessage(response)` to popup.
-10. Popup appends lines to notes list, entities to topics, summary; stores `accumulated_text`.
-11. User clicks **Take Notes** — popup POSTs `/index_notes` (ChromaDB) and `/summarize` (SQLite).
-12. User types question, clicks **Ask** — popup POSTs `/ask` with tab URL.
-13. Flask retrieves top 3 chunks, Gemini answers — `{ answer }` shown in `#ask-answer`.
-14. User revisits same URL — popup `GET /notes` loads prior summary/entities from SQLite.
-
----
-
-## All Libraries
-
-| Library | Role | File | Call |
-|---------|------|------|------|
-| PaddleOCR | OCR | `ocr.py` | `PaddleOCR().ocr(image_np, cls=True)` |
-| Pillow | Decode images | `ocr.py` | `Image.open(io.BytesIO(...))` |
-| numpy | Array for OCR | `ocr.py` | `np.array(image)` |
-| google-generativeai | Summaries + RAG answers | `summarization.py`, `rag.py` | `genai.GenerativeModel(...).generate_content(...)` |
-| spaCy | NER | `ner.py` | `nlp(text)` |
-| sentence-transformers | Embeddings | `rag.py` | `SentenceTransformer.encode(...)` |
-| chromadb | Vector store | `rag.py` | `PersistentClient`, `collection.add/query` |
-| sqlite3 | Notes persistence | `database.py` | `INSERT` / `SELECT` |
-| flask / flask-cors | HTTP API | `app.py` | routes, `CORS(app)` |
-| python-dotenv | Env vars | `app.py`, modules | `load_dotenv()` |
-
----
-
-## Environment Variables
-
-| Variable | Used in | How to get | If missing |
-|----------|---------|------------|------------|
-| `GEMINI_API_KEY` | `summarization.py`, `rag.py` | [Google AI Studio](https://aistudio.google.com) | Summaries and `/ask` fail with clear error |
-
-Copy `backend/.env.example` to `backend/.env` and set your key.
-
----
+- Main-thread protection with workers.
+- Load shedding through backpressure.
+- Payload reduction through compression.
+- Duplicate suppression in persistent storage.
+- Explicit expensive-operation boundaries for LLM usage.
+- Coordinate mapping between OCR image space and browser layout space.
+- Separation of responsibilities between popup, content script, worker, and backend.
 
 ## Setup
 
-```bash
+```powershell
 cd E:\Project\NotesNexus
 python -m venv env
-env\Scripts\activate          # Windows
+.\env\Scripts\Activate.ps1
 pip install -r requirements.txt
-python -m spacy download en_core_web_sm
-
-# backend/.env
-GEMINI_API_KEY=your_key_here
-
+python -c "import pytesseract; print(pytesseract.get_tesseract_version())"
 cd backend
 python app.py
 ```
 
-Load unpacked extension: Chrome → Extensions → Developer mode → Load unpacked → select `client/`.
+If Tesseract is missing, install it from:
 
----
+```text
+https://github.com/UB-Mannheim/tesseract/wiki
+```
 
-## client2.0 (not primary)
-
-Experimental fork with name “Injecta”, incomplete popup wiring, and `inject-2.0.js` without deduplication logic. Use **`client/`** for development.
+After changing extension files, reload NotesNexus from `chrome://extensions`.

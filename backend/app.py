@@ -1,193 +1,110 @@
-import json
-import os
-import time
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 
-import shortuuid
-from dotenv import load_dotenv
-from flask import Flask, jsonify, make_response, request
-from flask_cors import CORS, cross_origin
-
-from database import get_notes_for_url, init_db, save_note
-from ner import ner_spacy
-from ocr import paddle_ocr
-from rag import ask_question, index_lecture_text
-from summarization import summarize_with_fallback
-
-load_dotenv()
-
-sample = None
-sample_path = os.path.join(os.path.dirname(__file__), "images", "processpayload2.json")
-if os.path.exists(sample_path):
-    with open(sample_path, encoding="utf-8") as f:
-        sample = json.load(f)
+from database import (
+    get_full_text,
+    get_slide_timeline,
+    get_summary,
+    save_slide,
+    save_summary,
+)
+from gemini import answer_question, summarize
+from ner import extract_entities
+from ocr import run_ocr
 
 app = Flask(__name__)
 CORS(app)
 
-init_db()
-
 
 @app.route("/", methods=["GET"])
 def root():
-    return {"message": "Welcome to NotesNexus API"}
+    return jsonify({"message": "Welcome to NotesNexus API"})
 
 
 @app.route("/test", methods=["GET"])
 def test():
-    return {"status": "ok"}
-
-
-@app.route("/new_session", methods=["GET"])
-@cross_origin()
-def new_session():
-    return {"uuid": shortuuid.uuid()}
+    return jsonify({"status": "ok"})
 
 
 @app.route("/process", methods=["POST"])
-@cross_origin()
 def process():
-    """
-    Payload:
-        imageData: base64 image string
-        page_url: optional current page URL
-    """
-    data = request.get_json()
-
-    if data is None and sample:
-        imageData = sample["imageData"]
-        page_url = ""
-    else:
-        imageData = data.get("imageData")
-        page_url = data.get("page_url", "")
+    data = request.get_json() or {}
+    image_data = data.get("imageData")
+    page_url = data.get("page_url", "unknown")
+    video_timestamp = data.get("timestamp", "0:00")
 
     try:
-        paragraphs, lines = paddle_ocr(imageData)
-    except Exception as e:
+        ocr_result = run_ocr(image_data)
+    except Exception as exc:
         app.logger.exception("OCR failed")
+        return jsonify({"error": str(exc), "lines": [], "entities": [], "full_text": ""}), 500
+
+    full_text = ocr_result["full_text"]
+    lines = ocr_result["lines"]
+
+    if not full_text.strip():
         return jsonify(
             {
-                "error": str(e),
-                "full_text": "",
                 "lines": [],
                 "entities": [],
-                "summary": "",
-            }
-        ), 500
-
-    full_text = " . ".join(paragraphs)
-    entities = ner_spacy(full_text) if full_text.strip() else []
-
-    # Summaries are slow (Gemini). Use "Take Notes" -> /summarize instead.
-    response = make_response(
-        jsonify(
-            {
-                "full_text": full_text,
-                "lines": lines,
-                "entities": entities,
-                "summary": "",
+                "full_text": "",
+                "slide_number": 0,
+                "image_width": ocr_result["image_width"],
+                "image_height": ocr_result["image_height"],
             }
         )
-    )
 
-    return response
-
-
-@app.route("/summarize", methods=["POST"])
-@cross_origin()
-def summarize():
-    """
-    Payload:
-        text: string to summarize
-        page_url: optional page URL for SQLite persistence
-    """
-    data = request.get_json() or {}
-    text = data.get("text", "")
-    page_url = data.get("page_url", "")
-
-    if not text.strip():
-        return jsonify({"error": "text is required"}), 400
-
-    entities = ner_spacy(text)
-    try:
-        summary, used_fallback = summarize_with_fallback(text)
-    except Exception as e:
-        app.logger.exception("Summarization failed")
-        return jsonify({"error": str(e), "summary": "", "entities": entities}), 500
-
-    if page_url:
-        save_note(page_url, text, summary, entities)
+    entities = extract_entities(full_text)
+    saved, slide_num = save_slide(page_url, full_text, video_timestamp)
 
     return jsonify(
         {
-            "summary": summary,
+            "saved": saved,
+            "lines": lines,
             "entities": entities,
-            "used_fallback": used_fallback,
+            "full_text": full_text,
+            "slide_number": slide_num,
+            "image_width": ocr_result["image_width"],
+            "image_height": ocr_result["image_height"],
         }
     )
 
 
-@app.route("/index_notes", methods=["POST"])
-@cross_origin()
-def index_notes():
-    """
-    Index accumulated lecture text for RAG Q&A.
-    Payload:
-        text: all extracted text collected so far
-        page_url: current page URL
-    """
+@app.route("/summarize", methods=["POST"])
+def summarize_route():
     data = request.get_json() or {}
-    text = data.get("text", "")
-    page_url = data.get("page_url", "")
-
-    if not page_url:
-        return jsonify({"error": "page_url is required"}), 400
-    if not text.strip():
-        return jsonify({"error": "text is required"}), 400
-
-    result = index_lecture_text(page_url, text)
+    page_url = data.get("page_url", "unknown")
+    full_text = get_full_text(page_url)
+    result = summarize(full_text)
+    if isinstance(result, dict) and "summary" in result:
+        save_summary(page_url, result.get("summary", ""))
     return jsonify(result)
 
 
 @app.route("/ask", methods=["POST"])
-@cross_origin()
-def ask():
-    """
-    RAG Q&A over indexed lecture content.
-    Payload:
-        question: string
-        page_url: string
-    """
+def ask_route():
     data = request.get_json() or {}
     question = data.get("question", "")
-    page_url = data.get("page_url", "")
-    text = data.get("text", "")
+    page_url = data.get("page_url", "unknown")
+    full_text = get_full_text(page_url)
+    answer = answer_question(question, full_text)
+    return jsonify({"answer": answer})
 
-    if not question.strip():
-        return jsonify({"error": "question is required"}), 400
-    if not page_url:
-        return jsonify({"error": "page_url is required"}), 400
 
-    try:
-        if text.strip():
-            index_lecture_text(page_url, text)
-        answer = ask_question(page_url, question)
-        return jsonify({"answer": answer})
-    except Exception as e:
-        app.logger.exception("Ask failed")
-        return jsonify({"error": str(e), "answer": ""}), 500
+@app.route("/timeline", methods=["GET"])
+def timeline():
+    page_url = request.args.get("page_url", "unknown")
+    slides = get_slide_timeline(page_url)
+    return jsonify({"timeline": slides})
 
 
 @app.route("/notes", methods=["GET"])
-@cross_origin()
 def notes():
-    """Load previously saved notes for a page URL."""
-    page_url = request.args.get("page_url", "")
-    if not page_url:
-        return jsonify({"error": "page_url is required"}), 400
-
-    saved = get_notes_for_url(page_url)
-    return jsonify({"notes": saved})
+    page_url = request.args.get("page_url", "unknown")
+    summary = get_summary(page_url)
+    full_text = get_full_text(page_url)
+    return jsonify({"summary": summary, "full_text": full_text})
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    app.run(port=8000, debug=True)

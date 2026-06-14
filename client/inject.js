@@ -1,256 +1,197 @@
-alert("NotesNexus is capturing video text!");
-class Rect {
-  constructor(x, y, width, height, value = null) {
-    this.x = x;
-    this.y = y;
-    this.width = width;
-    this.height = height;
-    this.value = value;
+(() => {
+  if (window.__notesNexusLoaded) return
+  window.__notesNexusLoaded = true
+
+  let overlayContainer = null
+  let slideNumber = 0
+  let captureInterval = 2000
+  const minInterval = 1000
+  const maxInterval = 8000
+  let running = false
+  let captureTimer = null
+  let worker = null
+
+  function getVideo() {
+    return document.querySelector('video')
   }
 
-  repr() {
-    return `${this.value}`;
-  }
-}
-
-class Canvas {
-  constructor(canvas_id, onSelected) {
-    this.canvas_id = canvas_id;
-    this.selecting = false;
-    this.start_coord = { x: 0, y: 0 };
-    this.onSelected = onSelected;
-
-    this.selectedRect = new Rect(0, 0, 0, 0);
-    this.rects = [];
-    this.renderedRects = [];
+  function ensureContainer() {
+    if (!overlayContainer) {
+      overlayContainer = document.createElement('div')
+      overlayContainer.id = 'notesnexus-overlays'
+      overlayContainer.style.cssText = `
+        position: fixed;
+        top: 0; left: 0;
+        width: 100%; height: 100%;
+        pointer-events: none;
+        z-index: 9998;
+      `
+      document.body.appendChild(overlayContainer)
+    }
   }
 
-  // getDimensions() {
-  //   // let canvas = document.getElementById(this.canvas_id);
-  //   return { width: canvas.offsetWidth, height: canvas.offsetHeight };
-  // }
+  function clearOverlays() {
+    if (overlayContainer) {
+      overlayContainer.innerHTML = ''
+    }
+  }
 
-  showRects(rects) {
-    this.clear();
-    let video = document.querySelector("video");
-    for (var i = 0; i < rects.length; i++) {
-      let rect = rects[i];
-      if (rect.value) {
-        let text = document.createElement("div");
-        text.style.position = "absolute";
-        text.innerHTML = rect.value;
-        text.style.left = rect.x + video.getBoundingClientRect().left + "px";
-        text.style.top = rect.y + video.getBoundingClientRect().top + "px";
-        text.style.textAlign = "center";
-        text.style.color = "transparent";
+  function drawOverlays(lines, rect, sourceWidth, sourceHeight) {
+    clearOverlays()
 
-        // text.style.backgroundColor = "rgba(0, 0, 255, 0.2)";
+    const scaleX = rect.width / sourceWidth
+    const scaleY = rect.height / sourceHeight
 
-        text.style.setProperty("z-index", "2147483638", "important");
-        text.style.userSelect = "text";
-        text.style.fontSize = `${rect.height}px`;
-        document.body.appendChild(text);
-        // text.style.transform = `scale(${rect.width / text.offsetWidth}, 1)`;
-        this.renderedRects.push(text);
+    lines.forEach(line => {
+      const b = line.bounding_box
+      const div = document.createElement('div')
+      div.style.cssText = `
+        position: fixed;
+        left: ${rect.left + b.x * scaleX}px;
+        top: ${rect.top + b.y * scaleY}px;
+        width: ${b.width * scaleX}px;
+        height: ${b.height * scaleY}px;
+        color: transparent;
+        background: transparent;
+        user-select: text;
+        -webkit-user-select: text;
+        cursor: text;
+        font-size: ${Math.max(b.height * scaleY * 0.85, 8)}px;
+        font-family: monospace;
+        white-space: nowrap;
+        overflow: hidden;
+        pointer-events: all;
+        line-height: 1;
+        z-index: 9999;
+      `
+      div.textContent = line.text
+      overlayContainer.appendChild(div)
+    })
+  }
+
+  function getVideoTimestamp(video) {
+    const secs = Math.floor(video.currentTime)
+    const m = Math.floor(secs / 60)
+    const s = secs % 60
+    return `${m}:${s.toString().padStart(2, '0')}`
+  }
+
+  function getPlainRect(rect) {
+    return {
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height
+    }
+  }
+
+  function ensureWorker() {
+    if (worker) return worker
+
+    worker = new Worker(chrome.runtime.getURL('ocr-worker.js'))
+    worker.onmessage = (event) => {
+      const message = event.data || {}
+
+      if (message.type === 'unchanged') {
+        captureInterval = Math.min(captureInterval * 1.3, maxInterval)
+        return
       }
-      //   ctx.fillStyle = "rgba(129, 207, 224, 0.4)";
 
-      //   ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
-    }
-    this.rects = rects;
-  }
+      if (message.type === 'error') {
+        console.error('NotesNexus worker error:', message.error)
+        return
+      }
 
-  clear() {
-    this.renderedRects.forEach((val) => {
-      document.body.removeChild(val);
-    });
-    this.renderedRects = [];
-    this.rects = [];
-    this.selectedRect = new Rect(0, 0, 0, 0);
-  }
+      if (message.type !== 'result') return
 
-  startSelection(event) {
-    // this.selecting = true;
-    let canvas = document.getElementById(this.canvas_id);
-    this.start_coord.x = event.clientX - canvas.getBoundingClientRect().left;
-    this.start_coord.y = event.clientY - canvas.getBoundingClientRect().top;
-  }
+      const data = message.data || {}
+      captureInterval = minInterval
+      slideNumber = data.slide_number || slideNumber + 1
 
-  whileSelecting(event) {
-    if (!this.selecting) return;
-    let canvas = document.getElementById(this.canvas_id);
-    let ctx = canvas.getContext("2d");
-    canvas.style.pointerEvents = "auto";
+      drawOverlays(
+        data.lines || [],
+        message.rect,
+        data.image_width || message.sourceWidth,
+        data.image_height || message.sourceHeight
+      )
 
-    let width = event.clientX - canvas.getBoundingClientRect().left - this.start_coord.x;
-    let height = event.clientY - canvas.getBoundingClientRect().top - this.start_coord.y;
-
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = "rgba(129, 207, 224, 0.4)";
-    ctx.fillRect(this.start_coord.x, this.start_coord.y, width, height);
-  }
-
-  endSelection(event) {
-    this.selecting = false;
-    // let canvas = document.getElementById(this.canvas_id);
-    // canvas.style.pointerEvents = "none";
-
-    // let ctx = canvas.getContext("2d");
-    // ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    // let width = event.clientX - canvas.getBoundingClientRect().left - this.start_coord.x;
-    // let height = event.clientY - canvas.getBoundingClientRect().top - this.start_coord.y;
-
-    // // Error margin (for clicks)
-    // if ((-5 < width && width < 5) || (-5 < height && height < 5)) {
-    //   this.selectedRect = new Rect(0, 0, 0, 0);
-    //   // this.rects = [];
-    //   return;
-    // }
-
-    // this.selectedRect = new Rect(this.start_coord.x, this.start_coord.y, width, height);
-    // this.onSelected(this.selectedRect);
-  }
-}
-
-async function getAPI(data) {
-  data = data.substr(22);
-  let res = await fetch("http://localhost:8000/process", {
-    method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ imageData: data, page_url: window.location.href }),
-  });
-  if (!res.ok) {
-    let detail = res.statusText;
-    try {
-      const errBody = await res.json();
-      if (errBody.error) detail = errBody.error;
-    } catch (_) {}
-    throw new Error(`OCR server error (${res.status}): ${detail}`);
-  }
-  const content = await res.json();
-  return content;
-}
-
-function isDifferent(seen, incoming) {
-  for (var i = 0; i < incoming.length; i++) {
-    let val = incoming[i];
-    // console.log(val.repr(), seen);
-    if (!seen.hasOwnProperty(val.repr())) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-var seen = {};
-var ocrBusy = false;
-
-function main() {
-  var ghost = document.createElement("canvas");
-  ghost.id = "ghost";
-  ghost.style.position = "absolute";
-  ghost.style.display = "none";
-  document.body.appendChild(ghost);
-
-  let canvas = new Canvas("CursorLayer", (r) => {
-    console.log(r);
-  });
-
-  chrome.storage.local.get(["notesnexus_active"], (state) => {
-    if (state.notesnexus_active === false) return;
-    chrome.storage.local.set({ notesnexus_active: true });
-  });
-
-  setInterval(async function () {
-    const active = await new Promise((resolve) => {
-      chrome.storage.local.get(["notesnexus_active"], (s) => {
-        resolve(s.notesnexus_active !== false);
-      });
-    });
-    if (!active) return;
-
-    if (ocrBusy) return;
-    ocrBusy = true;
-
-    let video = document.querySelector("video");
-    if (video == null) {
-      ocrBusy = false;
-      return;
+      chrome.runtime.sendMessage({
+        type: 'OCR_RESULT',
+        payload: {
+          lines: data.lines || [],
+          entities: data.entities || [],
+          full_text: data.full_text || '',
+          slide_number: slideNumber,
+          timestamp: message.timestamp,
+          page_url: window.location.href
+        }
+      })
     }
 
-    // resize_canvas(video);
-    let stream = video.captureStream();
-    let imageCapture = new ImageCapture(stream.getVideoTracks()[0]);
-    let frame = await imageCapture.grabFrame();
-
-    var offScreenCanvas = document.getElementById("ghost");
-    const [frameWidth, frameHeight] = [frame.width, frame.height];
-    offScreenCanvas.width = frameWidth;
-    offScreenCanvas.height = frameHeight;
-
-    var context = offScreenCanvas.getContext("bitmaprenderer");
-    context.transferFromImageBitmap(frame);
-    var dataURL = offScreenCanvas.toDataURL();
-    var selectedRects = [];
-
-    let response;
-    try {
-      response = await getAPI(dataURL);
-    } catch (err) {
-      console.error("NotesNexus OCR fetch failed:", err);
-      ocrBusy = false;
-      return;
+    worker.onerror = (error) => {
+      console.error('NotesNexus worker failed:', error.message || error)
     }
 
-    if (!response || !response.lines) {
-      ocrBusy = false;
-      return;
-    }
+    return worker
+  }
 
-    response.lines.forEach((line) => {
-      const boundaryBox = line.bounding_box;
-      const [width, height] = [video.offsetWidth, video.offsetHeight];
-      const wScale = width / frameWidth;
-      const hScale = height / frameHeight;
-      selectedRects.push(
-        new Rect(
-          Math.round(boundaryBox.x * wScale),
-          Math.round(boundaryBox.y * hScale),
-          boundaryBox.width * wScale,
-          boundaryBox.height * hScale,
-          line.text
-        )
-      );
-    });
+  async function captureAndEnqueue() {
+    const video = getVideo()
+    if (!video || video.readyState < 2) return
 
-    // console.log(seen);
-    if (isDifferent(seen, selectedRects)) {
-      seen = {};
-      selectedRects.forEach((val) => {
-        seen[val.repr()] = true;
-      });
-      console.log("IS DIFFERENT");
-      canvas.showRects(selectedRects);
+    const rect = video.getBoundingClientRect()
+    ensureContainer()
+
+    const canvas = document.createElement('canvas')
+    canvas.width = video.videoWidth || 1280
+    canvas.height = video.videoHeight || 720
+    const ctx = canvas.getContext('2d')
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+
+    const bitmap = await createImageBitmap(canvas)
+    ensureWorker().postMessage(
+      {
+        type: 'frame',
+        bitmap,
+        rect: getPlainRect(rect),
+        sourceWidth: canvas.width,
+        sourceHeight: canvas.height,
+        pageUrl: window.location.href,
+        timestamp: getVideoTimestamp(video)
+      },
+      [bitmap]
+    )
+  }
+
+  function startCapture() {
+    if (running) return
+    running = true
+    ensureWorker()
+
+    async function loop() {
+      if (!running) return
       try {
-        chrome.runtime.sendMessage(
-          { type: "ocr_result", payload: response },
-          () => {
-            if (chrome.runtime.lastError) {
-              /* popup may be closed; background still saves to storage */
-            }
-          }
-        );
-      } catch (e) {
-        console.warn("NotesNexus extension was reloaded — refresh this page.");
+        await captureAndEnqueue()
+      } catch (error) {
+        console.error('NotesNexus capture error:', error)
       }
+      captureTimer = setTimeout(loop, captureInterval)
     }
-    ocrBusy = false;
-  }, 8000);
-}
+    loop()
+  }
 
-main();
+  function stopCapture() {
+    running = false
+    if (captureTimer) clearTimeout(captureTimer)
+    clearOverlays()
+    captureInterval = 2000
+    if (worker) {
+      worker.postMessage({ type: 'reset' })
+    }
+  }
+
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg.type === 'START') startCapture()
+    if (msg.type === 'STOP') stopCapture()
+  })
+})()

@@ -1,69 +1,60 @@
-<!doctype html>
+<!DOCTYPE html>
 <html>
-
 <head>
-	<link rel="stylesheet" href="../../css/main.css">
-	<link rel="preconnect" href="https://fonts.googleapis.com">
-	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-	<link href="https://fonts.googleapis.com/css2?family=Dosis:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-	<script src="popup.js"></script>
-
+  <meta charset="utf-8">
+  <style>
+    body { width: 360px; font-family: sans-serif; padding: 12px; background: #f9f9f9; }
+    h2 { color: #4285F4; margin: 0 0 12px; }
+    button {
+      width: 100%; padding: 8px; margin: 4px 0;
+      border: none; border-radius: 6px;
+      background: #4285F4; color: white;
+      cursor: pointer; font-size: 14px;
+    }
+    button:disabled { opacity: 0.6; }
+    .output {
+      background: white; border: 1px solid #ddd;
+      border-radius: 6px; padding: 8px;
+      margin: 6px 0; font-size: 12px;
+      max-height: 120px; overflow-y: auto;
+      min-height: 32px;
+    }
+    input {
+      width: 94%; padding: 8px; margin: 4px 0;
+      border: 1px solid #ddd; border-radius: 6px;
+    }
+    .section { margin-top: 10px; border-top: 1px solid #eee; padding-top: 10px; }
+    .label { font-size: 11px; color: #666; margin-bottom: 2px; }
+  </style>
 </head>
-
 <body>
-	<div class="container">
-		<div class="popup-header">
-			<h1 class="logo">
-				NotesNexus
-				<img src="../../icons/icon96.png" alt="logo">
-			</h1>
-		</div>
-		<div class="popup-content">
-			<button id='capture-btn'>Start NotesNexus</button>
-			<button id="stop-btn">Stop</button>
-			<button id="take-notes-btn">Take Notes</button>
-			<button id="clear-btn" type="button">Clear saved UI</button>
-			<p class="description">Start watching your class and NotesNexus will take notes for you!
-			</p>
-		</div>
+  <h2>NotesNexus</h2>
 
-		<div id="qa-section" class="popup-extra">
-			<h3><strong>Ask about this lecture</strong></h3>
-			<input type="text" id="question-input" placeholder="Ask about this lecture..." />
-			<button id="ask-btn">Ask</button>
-			<div id="ask-loading" style="display: none;">Loading...</div>
-			<div id="ask-answer"></div>
-		</div>
+  <button id="toggleBtn">Start NotesNexus</button>
 
+  <div class="section">
+    <div class="label">Live OCR</div>
+    <div class="output" id="ocrOutput">Waiting for capture...</div>
+    <div class="label">Lecture key terms</div>
+    <div class="output" id="entities"></div>
+  </div>
 
-		<div id='results' class="popup-extra">
-			<div class="btns">
-				<button id="notesbtn">&#x1F4DD extracted notes</button>
-				<button id="topicsbtn">&#x1F4DD key topics</button>
-				<button id="summarybtn">&#x1F4A1 summary</button>
-			</div>
-			<div id='notes-div'>
-				<h3><strong><span>&#x1F4DD</span> Extracted Notes<br></strong></h3>
-				<ul id='notes-list'></ul>
-				<p id="notes"></span></p>
+  <div class="section">
+    <button id="summarizeBtn">Summarize Notes</button>
+    <div class="output" id="summaryOutput"></div>
+  </div>
 
-			</div>
+  <div class="section">
+    <input type="text" id="questionInput" placeholder="Ask a question about the lecture...">
+    <button id="askBtn">Ask</button>
+    <div class="output" id="answerOutput"></div>
+  </div>
 
-			<div id='entities-div'>
-				<h3><strong><span>&#x1F4A1</span> Key Topics<br> </strong></h3>
-				<ul id='entities-list'></ul>
-				<p id='entities'></p>
-			</div>
+  <div class="section">
+    <button id="timelineBtn">Show Slide Timeline</button>
+    <div class="output" id="timelineOutput"></div>
+  </div>
 
-			<div id='summary-div'>
-				<h3><strong><span>&#x2728</span> Summary<br> </strong></h3>
-				<p id='summary'></p>
-			</div>
-		</div>
-	</div>
-
-	<!-- chrome.tabs.script -->
-
+  <script src="popup.js"></script>
 </body>
-
 </html>
