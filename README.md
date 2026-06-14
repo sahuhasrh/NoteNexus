@@ -23,6 +23,26 @@ NotesNexus is a Chrome extension and Flask backend that makes text inside lectur
 - YAKE keyword extraction
 - Gemini API for summaries and Q&A
 
+## Supported Platforms
+
+NotesNexus works on browser-based video platforms that expose an accessible HTML5 `<video>` element.
+
+Expected to work:
+
+- YouTube
+- Google Meet in browser
+- Zoom web
+- Microsoft Teams web
+- Discord web
+- Coursera, Udemy, edX
+- Vimeo, Loom
+
+Limitations:
+
+- Native desktop apps like Zoom desktop or Teams desktop are not supported.
+- Some DRM-protected or restricted video sites may block frame capture.
+- Platforms without a normal `<video>` element cannot be captured by the extension.
+
 ## Quick Start
 
 ```powershell
